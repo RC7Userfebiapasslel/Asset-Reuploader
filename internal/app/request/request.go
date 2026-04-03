@@ -14,6 +14,8 @@ type RawRequest struct {
 	AssetType       string  `json:"assetType"`
 	ExportJSON      bool    `json:"exportJSON"`
 	IsGroup         bool    `json:"isGroup"`
+	UsePermissionUpload bool  `json:"UsePermissionUpload"`
+    PermissionUserID   int64  `json:"PermissionUserID"`
 }
 
 type Request struct {
