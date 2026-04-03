@@ -22,11 +22,11 @@ import (
 	"github.com/RC7Userfebiapasslel/Asset-Reuploader/internal/roblox/assetdelivery"
 	"github.com/RC7Userfebiapasslel/Asset-Reuploader/internal/roblox/assets"
 	"github.com/RC7Userfebiapasslel/Asset-Reuploader/internal/roblox/develop"
+	"github.com/RC7Userfebiapasslel/Asset-Reuploader/internal/roblox/friends"
 	"github.com/RC7Userfebiapasslel/Asset-Reuploader/internal/roblox/games"
 	"github.com/RC7Userfebiapasslel/Asset-Reuploader/internal/roblox/publish"
 	"github.com/RC7Userfebiapasslel/Asset-Reuploader/internal/shardedmap"
 	"github.com/RC7Userfebiapasslel/Asset-Reuploader/internal/taskqueue"
-	"github.com/RC7Userfebiapasslel/Asset-Reuploader/internal/roblox/friends"
 )
 
 const assetTypeID int32 = 3
@@ -87,6 +87,60 @@ func Reupload(ctx *context.Context, r *request.Request) {
 	permissionQueue := taskqueue.New[*assets.PermissionResponse](time.Minute, 60)
 	permissionRequest := assetutils.NewPermissionBodyFromIds([]int64{r.UniverseID})
 
+	// -------------------------------------------------------------------
+	// User Permission Upload setup
+	// Reads config, verifies friendship, and prepares a friend client.
+	// If any step fails the whole reupload is aborted with a clear error.
+	// -------------------------------------------------------------------
+	cfg := ctx.Config.UserPermissionUpload // adjust field path if yours differs
+	permUploadEnabled := cfg.Enabled
+
+	// uploadClient is what actually sends audio to Roblox.
+	// In normal mode this is your own client; in permission-upload mode
+	// it is a second client authenticated as the friend account.
+	uploadClient := client
+	uploadGroupID := groupID // friend uploads always go to a user, not a group
+
+	if permUploadEnabled {
+		// Build a client from the friend's cookie.
+		fc, err := roblox.NewClient(cfg.FriendCookie)
+		if err != nil {
+			logger.Error("UserPermissionUpload: failed to create friend client: " + err.Error())
+			return
+		}
+
+		// Fetch your own user ID so we can call the friends endpoint.
+		myUserID, err := client.GetAuthenticatedUserID()
+		if err != nil {
+			logger.Error("UserPermissionUpload: failed to get own user ID: " + err.Error())
+			return
+		}
+
+		// Verify that the target user is actually a friend before touching anything.
+		isFriend, err := friends.IsFriend(client, myUserID, cfg.FriendUserID)
+		if err != nil {
+			logger.Error(fmt.Sprintf(
+				"UserPermissionUpload: friendship check failed for user %d: %s",
+				cfg.FriendUserID, err.Error(),
+			))
+			return
+		}
+		if !isFriend {
+			logger.Error(fmt.Sprintf(
+				"UserPermissionUpload: user %d is not a friend — aborting. Add them as a friend first.",
+				cfg.FriendUserID,
+			))
+			return
+		}
+
+		uploadClient = fc
+		uploadGroupID = 0 // friend account — always upload to user, never a group
+		logger.Info(fmt.Sprintf(
+			"UserPermissionUpload: friend %d verified. Audio will be uploaded to their account.",
+			cfg.FriendUserID,
+		))
+	}
+
 	logger.Println("Reuploading sounds...")
 
 	newBatchError := func(amt int, m string, err any) {
@@ -100,6 +154,8 @@ func Reupload(ctx *context.Context, r *request.Request) {
 		logger.Error(uploaderror.New(int(newValue), idsToUpload, m, assetInfo, err))
 	}
 
+	// grantPermissions is only used in normal (non-permission-upload) mode.
+	// In permission-upload mode the user runs a console script instead.
 	grantPermissions := func(newID int64) (*assets.PermissionResponse, error) {
 		permissionsClient, _ := roblox.NewClient("")
 		permissionsClient.Cookie = client.Cookie
@@ -145,13 +201,17 @@ func Reupload(ctx *context.Context, r *request.Request) {
 
 		oldName := assetInfo.Name
 
+		// Always fetch the raw asset data using the original client —
+		// we need read access to the source asset, not write access.
 		assetData, err := clientutils.GetRequest(client, location)
 		if err != nil {
 			newUploadError("Failed to get asset data", assetInfo, err)
 			return
 		}
 
-		uploadHandler, err := publish.NewUploadAudioHandler(client, assetInfo.Name, assetData, groupID)
+		// Use uploadClient (friend client in permission-upload mode, own client otherwise).
+		// uploadGroupID is 0 when uploading to a friend so it lands on their user account.
+		uploadHandler, err := publish.NewUploadAudioHandler(uploadClient, assetInfo.Name, assetData, uploadGroupID)
 		if err != nil {
 			newUploadError("Failed to get upload handler", assetInfo, err)
 			return
@@ -173,9 +233,18 @@ func Reupload(ctx *context.Context, r *request.Request) {
 
 					switch err {
 					case publish.UploadAudioErrors.ErrNotAuthenticated:
-						clientutils.GetNewCookie(ctx, r, "cookie expired")
+						if permUploadEnabled {
+							// The friend's cookie expired — nothing we can do automatically.
+							logger.Error("UserPermissionUpload: friend cookie expired or invalid. Update FriendCookie in config.ini.")
+						} else {
+							clientutils.GetNewCookie(ctx, r, "cookie expired")
+						}
 					case publish.UploadAudioErrors.ErrQuotaExceeded:
-						clientutils.GetNewCookie(ctx, r, "audio limit exceeded")
+						if permUploadEnabled {
+							logger.Error("UserPermissionUpload: friend account audio limit exceeded.")
+						} else {
+							clientutils.GetNewCookie(ctx, r, "audio limit exceeded")
+						}
 					case publish.UploadAudioErrors.ErrModerated:
 						assetInfo.Name = fmt.Sprintf("(%s) [Censored]", assetInfo.Name)
 					default:
@@ -203,19 +272,34 @@ func Reupload(ctx *context.Context, r *request.Request) {
 			NewID: newID,
 		})
 
-		if _, err = grantPermissions(newID); err != nil {
-			message := fmt.Sprintf(">> %s(%d) failed to grant permission: ", assetInfo.Name, newID) + err.Error()
-			if pauseController.IsPaused {
-				color.Error.Fprintln(logger.History, message)
-			} else {
-				logger.Error(message)
-			}
-		} else {
-			message := fmt.Sprintf(">> %s(%d) granted permission", assetInfo.Name, newID)
+		if permUploadEnabled {
+			// IDs are replaced in-game as normal. Permission granting is skipped here —
+			// the user runs a console script to grant the game access to the friend-owned audio.
+			message := fmt.Sprintf(
+				">> %s (old: %d → new: %d) uploaded to friend account. Run console script to grant game permission.",
+				assetInfo.Name, assetInfo.ID, newID,
+			)
 			if pauseController.IsPaused {
 				color.Info.Fprintln(logger.History, message)
 			} else {
 				logger.Info(message)
+			}
+		} else {
+			// Normal mode: attempt to grant the game permission automatically.
+			if _, err = grantPermissions(newID); err != nil {
+				message := fmt.Sprintf(">> %s(%d) failed to grant permission: ", assetInfo.Name, newID) + err.Error()
+				if pauseController.IsPaused {
+					color.Error.Fprintln(logger.History, message)
+				} else {
+					logger.Error(message)
+				}
+			} else {
+				message := fmt.Sprintf(">> %s(%d) granted permission", assetInfo.Name, newID)
+				if pauseController.IsPaused {
+					color.Info.Fprintln(logger.History, message)
+				} else {
+					logger.Info(message)
+				}
 			}
 		}
 	}
