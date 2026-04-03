@@ -111,4 +111,23 @@ return function(ui: UiLibrary.Ui, plugin: Plugin)
     local element = themeList.elements[currentTheme.Id]
     element.instance.BackgroundColor3 = currentTheme.SelectedColor
     element.selected = true
+
+-- User Permission Upload toggle
+split:CreateToggle("User Permission Uploading", function(state)
+    plugin:SetSetting("UserPermissionUpload", state)
+end, plugin:GetSetting("UserPermissionUpload") == true)
+
+-- Friend User ID input
+local friendInput; friendInput = split:CreateInput(
+    "Friend UserID: " .. tostring(plugin:GetSetting("FriendUserID") or ""),
+    function(input)
+        local id = tonumber(input)
+        if not id then
+            ui:Notify("Notification", "Friend UserID must be a number.")
+            return
+        end
+        plugin:SetSetting("FriendUserID", id)
+        friendInput.instance.TextBox.PlaceholderText = "Friend UserID: " .. id
+    end
+)
 end
